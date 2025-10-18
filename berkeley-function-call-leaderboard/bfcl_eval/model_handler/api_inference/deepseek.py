@@ -1,5 +1,7 @@
 import json
 import os
+import re
+import uuid
 import time
 from typing import Any
 
@@ -13,6 +15,75 @@ from bfcl_eval.model_handler.utils import (
 from openai import OpenAI, RateLimitError
 from overrides import override
 
+TOOL_CALL_SYSTEM_PROMPT = 'You are a helpful assistant with tool calling capabilities. ' + \
+        'When a tool call is needed, you MUST use the following format to issue the call:\n' + \
+        '<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>FUNCTION_NAME\n' + \
+        '```json\n{"param1": "value1", "param2": "value2"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>\n\n' + \
+        'Make sure the JSON is valid.' + \
+        '## Tools\n\n### Function\n\nYou have the following functions available:\n\n'
+
+class SimpleDeepSeekCallExtractor:
+    """简化版 DeepSeek V3 function call 提取工具"""
+
+    def __init__(self):
+        self.bot_token = "<｜tool▁calls▁begin｜>"
+        self.eot_token = "<｜tool▁calls▁end｜>"
+        self.func_call_regex = r"<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>"
+        self.func_detail_regex = (
+            r"<｜tool▁call▁begin｜>(.*?)<｜tool▁sep｜>(.*?)\n```json\n(.*?)\n```<｜tool▁call▁end｜>"
+        )
+
+    def has_tool_call(self, text: str) -> bool:
+        return self.bot_token in text
+
+    def detect_and_parse(self, text: str):
+        idx = text.find(self.bot_token)
+        normal_text = text[:idx].strip() if idx != -1 else text
+
+        if not self.has_tool_call(text):
+            return normal_text, []
+
+        call_blocks = re.findall(self.func_call_regex, text, flags=re.DOTALL)
+        calls = []
+
+        for block in call_blocks:
+            match = re.search(self.func_detail_regex, block, flags=re.DOTALL)
+            if not match:
+                continue
+
+            func_name = match.group(2).strip()
+            func_args_str = match.group(3).strip()
+            try:
+                func_args = json.loads(func_args_str)
+            except json.JSONDecodeError:
+                func_args = func_args_str
+            calls.append({"name": func_name, "arguments": json.dumps(func_args, ensure_ascii=False)})
+
+        return normal_text, calls
+
+
+def add_tool_prompt(messages, tools):
+    tool_prompt = TOOL_CALL_SYSTEM_PROMPT
+    for tool in tools:
+        if tool['type'] == 'function':
+            function = tool['function']
+            function_json_object = {
+                'description': function["description"],
+                'name': function["name"],
+                'parameters': function["parameters"],
+                'strict': False,
+            }
+            function_json_str = json.dumps(function_json_object, ensure_ascii=False)
+            tool_prompt += f'- `' + function['name'] + '`:\n```json\n' + function_json_str + '\n```\n'
+
+    if messages[0]["role"] == "system":
+        messages[0]["content"] = messages[0]["content"] + "\n\n" + tool_prompt
+    # Otherwise, use the system prompt template to create a new system prompt.
+    else:
+        messages.insert(
+            0,
+            {"role": "system", "content": tool_prompt},
+        )
 
 class DeepSeekAPIHandler(OpenAICompletionsHandler):
     def __init__(
@@ -28,6 +99,7 @@ class DeepSeekAPIHandler(OpenAICompletionsHandler):
         self.client = OpenAI(
             base_url="https://api.deepseek.com", api_key=os.getenv("DEEPSEEK_API_KEY")
         )
+        self.tool_call_parser = SimpleDeepSeekCallExtractor()
 
     # The deepseek API is unstable at the moment, and will frequently give empty responses, so retry on JSONDecodeError is necessary
     @retry_with_backoff(error_type=[RateLimitError, json.JSONDecodeError])
@@ -65,10 +137,10 @@ class DeepSeekAPIHandler(OpenAICompletionsHandler):
             )
 
         if len(tools) > 0:
+            add_tool_prompt(message, tools)
             return self.generate_with_backoff(
                 model=api_model_name,
                 messages=message,
-                tools=tools,
                 temperature=self.temperature,
             )
         else:
@@ -140,3 +212,25 @@ class DeepSeekAPIHandler(OpenAICompletionsHandler):
         response_data = super()._parse_query_response_FC(api_response)
         self._add_reasoning_content_if_available_FC(api_response, response_data)
         return response_data
+
+    @override
+    def _parse_query_response_FC(self, api_response: Any) -> dict:
+        _, tool_calls = self.tool_call_parser.detect_and_parse(api_response.choices[0].message.content)
+        if len(tool_calls) > 0:
+            model_responses = [
+                {func_call['name']: func_call['arguments']} for func_call in tool_calls
+            ]
+            tool_call_ids = [f"call_{uuid.uuid4().hex[:8]}" for _ in tool_calls]
+        else:
+            model_responses = api_response.choices[0].message.content
+            tool_call_ids = []
+
+        model_responses_message_for_chat_history = api_response.choices[0].message
+
+        return {
+            "model_responses": model_responses,
+            "model_responses_message_for_chat_history": model_responses_message_for_chat_history,
+            "tool_call_ids": tool_call_ids,
+            "input_token": api_response.usage.prompt_tokens,
+            "output_token": api_response.usage.completion_tokens,
+        }
